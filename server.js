@@ -2,11 +2,14 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const admin = require('firebase-admin');
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 
 const app = express();
 const PORT = Number(process.env.PORT || 10000);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 
 if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
   throw new Error('Missing FIREBASE_SERVICE_ACCOUNT_JSON environment variable');
@@ -19,11 +22,12 @@ try {
   throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON');
 }
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+initializeApp({
+  credential: cert(serviceAccount),
 });
 
-const db = admin.firestore();
+const auth = getAuth();
+const db = getFirestore();
 
 app.use(helmet());
 app.use(cors({
@@ -49,6 +53,48 @@ function fail(res, status, message) {
   return res.status(status).json({ error: message });
 }
 
+async function notifyDiscord(order) {
+  if (!DISCORD_WEBHOOK_URL) {
+    console.warn('DISCORD_WEBHOOK_URL is not configured; skipping notification.');
+    return;
+  }
+
+  const itemLines = order.items
+    .map(item => `• ${item.title} × ${item.quantity} — ${item.lineTotal.toFixed(2)} ر.س`)
+    .join('\n');
+
+  const payload = {
+    username: 'MAX STORE',
+    embeds: [{
+      title: 'طلب جديد',
+      color: 0x2ecc71,
+      fields: [
+        { name: 'رقم الطلب', value: order.orderId, inline: true },
+        { name: 'الإجمالي', value: `${order.total.toFixed(2)} ر.س`, inline: true },
+        { name: 'العميل', value: order.customerName || 'مستخدم', inline: true },
+        { name: 'المنتجات', value: itemLines.slice(0, 1024) || '—' },
+      ],
+      timestamp: new Date().toISOString(),
+    }],
+  };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(DISCORD_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`Discord returned HTTP ${response.status}`);
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function requireUser(req, res, next) {
   const header = req.headers.authorization || '';
   if (!header.startsWith('Bearer ')) {
@@ -57,7 +103,7 @@ async function requireUser(req, res, next) {
 
   const idToken = header.slice('Bearer '.length).trim();
   try {
-    req.user = await admin.auth().verifyIdToken(idToken);
+    req.user = await auth.verifyIdToken(idToken);
     next();
   } catch (error) {
     console.error('Token verification failed:', error.message);
@@ -157,7 +203,7 @@ app.post('/createOrder', orderLimiter, requireUser, async (req, res) => {
     const total = Number(Math.max(0, cleanSubtotal - discountAmount).toFixed(2));
     const orderRef = db.collection('orders').doc();
 
-    await orderRef.set({
+    const order = {
       orderId: orderRef.id,
       userId: req.user.uid,
       customerName: req.user.name || 'مستخدم',
@@ -171,9 +217,21 @@ app.post('/createOrder', orderLimiter, requireUser, async (req, res) => {
       couponCode: couponCode || null,
       status: 'pending_review',
       paymentMethod: 'bank_transfer',
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+
+    await orderRef.set({
+      ...order,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
     });
+
+    try {
+      await notifyDiscord(order);
+    } catch (discordError) {
+      console.error('Discord notification failed:', discordError.message);
+    }
 
     res.status(201).json({
       success: true,
